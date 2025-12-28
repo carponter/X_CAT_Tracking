@@ -14,12 +14,26 @@ def save(args, save_name, model, wandb, ep=None):
     save_dir = '../trained_models/'
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
+    
+    # 🔥 保存完整的checkpoint，包含模型结构信息
+    checkpoint = {
+        'state_dict': model.state_dict(),
+        'config': vars(args) if hasattr(args, '__dict__') else {}
+    }
+    
+    # 🔥 如果model有cnn_lstm属性，单独保存（用于frozen feature extraction）
+    if hasattr(model, 'cnn_lstm'):
+        checkpoint['cnn_lstm_state_dict'] = model.cnn_lstm.state_dict()
+        print(f"✅ 保存CNN_LSTM权重用于frozen feature extraction")
+    
     if not ep == None:
-        torch.save(model.state_dict(), save_dir + args.run_name + save_name + str(ep) + ".pth")
-        wandb.save(save_dir + args.run_name + save_name + str(ep) + ".pth")
+        save_path = save_dir + args.run_name + save_name + str(ep) + ".pth"
+        torch.save(checkpoint, save_path)
+        wandb.save(save_path)
     else:
-        torch.save(model.state_dict(), save_dir + args.run_name + save_name + ".pth")
-        wandb.save(save_dir + args.run_name + save_name + ".pth")
+        save_path = save_dir + args.run_name + save_name + ".pth"
+        torch.save(checkpoint, save_path)
+        wandb.save(save_path)
 
 def collect_random(env, dataset, num_samples=200):
     state = env.reset()
