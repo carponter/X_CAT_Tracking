@@ -57,12 +57,17 @@ class FrozenFeatureExtractor(nn.Module):
         feat = self.encoder.CNN_Simple(x)
         feat = feat.view(feat.size(0), -1)   # [B, 576]
         return feat
+    
+    def extract_cnn_features(self, x):
+        """Alias for _forward_cnn to extract CNN features"""
+        return self._forward_cnn(x)   
+    
     def _forward_lstm(self, x, hidden=None):
         B, T = x.shape[0], x.shape[1]
         x = x.view(B * T, 3, 64, 64)
         cnn_feat = self.encoder.CNN_Simple(x)
         cnn_feat = cnn_feat.view(B, T, -1)  # [B, T, 576]
-        lstm_out, hidden = self.encoder.lstm(cnn_feat, hidden)
+        lstm_out, hidden = self.encoder.lstm(cnn_feat, hidden)  
         return lstm_out[:, -1], hidden
 
 def create_save_dirs():
@@ -247,25 +252,38 @@ class AllDataDataset(Dataset):
         
         # cnn_feature as state
         if self.use_frozen_features and self.feature_extractor is not None:
+            print(f"\n Extracting CNN features from {len(self.states)} samples...")
             self.state_features = []
             self.next_state_features = []
-            batch_size = 128
+            batch_size = 256  # Increased for faster processing
             num_batches = (len(self.states) + batch_size - 1) // batch_size
+            print(f"   Total batches to process: {num_batches}")
+            
             for i in range(num_batches):               
                 start_idx = i * batch_size
                 end_idx = min((i + 1) * batch_size, len(self.states))
 
+                # Process states
                 states_batch = torch.from_numpy(self.states[start_idx:end_idx]).to(self.feature_extractor.device)
                 with torch.no_grad():
                     features_batch = self.feature_extractor.extract_cnn_features(states_batch).cpu().numpy()
                 self.state_features.append(features_batch)
                 
+                # Process next_states
                 next_states_batch = torch.from_numpy(self.next_states[start_idx:end_idx]).to(self.feature_extractor.device)
                 with torch.no_grad():
                     next_features_batch = self.feature_extractor.extract_cnn_features(next_states_batch).cpu().numpy()
                 self.next_state_features.append(next_features_batch)
+                
+                # Progress reporting
+                if (i + 1) % 100 == 0 or (i + 1) == num_batches:
+                    progress = (i + 1) / num_batches * 100
+                    print(f"   Progress: {i+1}/{num_batches} ({progress:.1f}%) - Processed {end_idx}/{len(self.states)} samples")
+            
+            print(f" Concatenating features...")
             self.state_features = np.concatenate(self.state_features, axis=0)
             self.next_state_features = np.concatenate(self.next_state_features, axis=0)
+            print(f"✅ Feature extraction completed! Shape: {self.state_features.shape}")
     
     def __len__(self):
         return len(self.states)
@@ -300,10 +318,33 @@ class AllDataDataset(Dataset):
             )
 
 
+def get_cvae_loss(model, obs, action, reward, next_obs, 
+                  tracker_id, target_id, linear_v_id, angular_v_id,
+                  linear_v_max, angular_v_max, beta=0.1, lambda_speed=0.1):
+    total_loss, loss_dict = model.compute_total_loss(
+        obs, action, reward, next_obs,
+        tracker_id, target_id, linear_v_max, angular_v_max,
+        beta=beta, lambda_speed=lambda_speed
+    )
+    kl_loss = loss_dict['kl_loss']
+    obs_loss = loss_dict['obs_loss']
+    rew_loss = loss_dict['rew_loss']
+    speed_loss = loss_dict['speed_loss']
+    linear_loss = loss_dict['linear_loss']
+    angular_loss = loss_dict['angular_loss']
+    
+    unscaled_obs = obs_loss
+    unscaled_rew = rew_loss
+    ref_obs = 0.0
+    ref_rew = 0.0
+    return (kl_loss, obs_loss, rew_loss, unscaled_obs, unscaled_rew, ref_obs, ref_rew,
+            speed_loss, linear_loss, angular_loss, total_loss)
+
+
 def get_config():
     parser = argparse.ArgumentParser(description='CVAE Training')
     parser.add_argument("--run_name", type=str, default="CVAE-mutidim-", help="run_name")
-    parser.add_argument("--data_path", type=str, default="/home/hjz/EVT/Offline_RL_Active_Tracking/Tracking-Anything-with-DEVA/data/train_data", help="data_path")
+    parser.add_argument("--data_path", type=str, default="C:\\Offline_RL_Active_Tracking-master\\Offline_RL_Active_Tracking-master\\data\\train_data", help="data_path")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--save_interval", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=512)
@@ -317,15 +358,15 @@ def get_config():
     parser.add_argument("--cvae_mode", type=str, default='cat_all', choices=['full_encoding', 'cat_all', 'avgpool_fusion'])
     # L = L_recon + β*L_KL + λ*(L_speed + L_ang)
     parser.add_argument("--beta", type=float, default=0.1, help="kl divergence weight")
-    parser.add_argument("--lambda_speed", type=float, default=0.1, help="weak supervision")
+    parser.add_argument("--lambda_speed", type=float, default=0.05, help="weak supervision")
     parser.add_argument("--predict_state_difference", action='store_true', default=False)
     parser.add_argument("--output_variance", type=str, default='output', choices=['zero', 'parameter', 'output', 'output_raw', 'reference'])
-    parser.add_argument("--logvar_min", type=float, default=-15.0)
+    parser.add_argument("--logvar_min", type=float, default=-15.0, help="Minimum log variance (was -20, too small!)")
     parser.add_argument("--logvar_max", type=float, default=2.0)
     parser.add_argument("--merge_reward_next_state", action='store_true', default=False)
     parser.add_argument("--use_gpu", action="store_true", default=True)
     parser.add_argument("--input_type", type=str, default='deva')
-    parser.add_argument("--frozen_cnn_lstm_path", type=str, default="/home/hjz/EVT/Offline_RL_Active_Tracking/Tracking-Anything-with-DEVA/Agent/CQL-SAC-base-CQL-SAC1000.pth", help="pretrained weights path")
+    parser.add_argument("--frozen_cnn_lstm_path", type=str, default="C:\\Offline_RL_Active_Tracking-master\\Offline_RL_Active_Tracking-master\\trained_models\\CQL-SAC-base-CQL-SAC1000.pth", help="pretrained weights path")
     parser.add_argument("--use_cnn_features", action="store_true", default=True)
     parser.add_argument("--use_lstm_features", action="store_true", default=False)
     args = parser.parse_args()
@@ -344,7 +385,12 @@ def main():
     
     feature_extractor = None
     if config.frozen_cnn_lstm_path and config.use_cnn_features:
-        feature_extractor = FrozenFeatureExtractor(checkpoint_path=config.frozen_cnn_lstm_path, use_cnn_features=True, use_lstm_features=False, device=device)
+        output_type = "cnn" if config.use_cnn_features else "lstm"
+        feature_extractor = FrozenFeatureExtractor(
+            checkpoint_path=config.frozen_cnn_lstm_path, 
+            output_type=output_type, 
+            device=device
+        )
     train_dataset = AllDataDataset(config.data_path, config, feature_extractor=feature_extractor)
     
     current_dir = os.getcwd()
@@ -376,7 +422,7 @@ def main():
         logvar_max=config.logvar_max,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2, drop_last=True)
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=0, pin_memory=False, drop_last=True)
     model.train()
     global_step = 0
     
@@ -385,20 +431,38 @@ def main():
         epoch_losses = defaultdict(float)
         n_batches = 0
         for batch_idx, batch_data in enumerate(train_loader):
+            obs, action, reward, next_obs, tracker_id, target_id, linear_v_id, angular_v_id, linear_v_max, angular_v_max = batch_data
+            
+            obs = obs.to(device)
+            action = action.to(device)
+            reward = reward.to(device)
+            next_obs = next_obs.to(device)
+            tracker_id = tracker_id.to(device)
+            target_id = target_id.to(device)
+            linear_v_id = linear_v_id.to(device)
+            angular_v_id = angular_v_id.to(device)
+            linear_v_max = linear_v_max.to(device)
+            angular_v_max = angular_v_max.to(device)
+            
             kl_loss, obs_loss, rew_loss, unscaled_obs, unscaled_rew, ref_obs, ref_rew, \
                 speed_loss, linear_loss, angular_loss, total_loss = \
-                get_cvae_loss(model, *batch_data, beta=config.beta, lambda_speed=getattr(config, 'lambda_speed', 0.1))
+                get_cvae_loss(model, obs, action, reward, next_obs, 
+                            tracker_id, target_id, linear_v_id, angular_v_id,
+                            linear_v_max, angular_v_max, 
+                            beta=config.beta, lambda_speed=getattr(config, 'lambda_speed', 0.1))
             
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
 
-            epoch_losses["kl"] += kl_loss.item()
-            epoch_losses["obs"] += obs_loss.item()
-            epoch_losses["rew"] += rew_loss.item()
-            epoch_losses["speed"] += speed_loss.item()
-            epoch_losses["linear"] += linear_loss.item()
-            epoch_losses["angular"] += angular_loss.item()
+            # kl_loss, obs_loss etc. are already scalars from loss_dict
+            # total_loss is a tensor, need .item()
+            epoch_losses["kl"] += kl_loss
+            epoch_losses["obs"] += obs_loss
+            epoch_losses["rew"] += rew_loss
+            epoch_losses["speed"] += speed_loss
+            epoch_losses["linear"] += linear_loss
+            epoch_losses["angular"] += angular_loss
             epoch_losses["total"] += total_loss.item()
             n_batches += 1
             global_step += 1
