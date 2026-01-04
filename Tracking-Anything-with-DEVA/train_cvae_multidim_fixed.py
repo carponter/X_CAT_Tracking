@@ -343,11 +343,11 @@ def get_cvae_loss(model, obs, action, reward, next_obs,
 
 def get_config():
     parser = argparse.ArgumentParser(description='CVAE Training')
-    parser.add_argument("--run_name", type=str, default="CVAE-mutidim-", help="run_name")
+    parser.add_argument("--run_name", type=str, default="CVAE-mutidim-cnn-", help="run_name")
     parser.add_argument("--data_path", type=str, default="C:\\Offline_RL_Active_Tracking-master\\Offline_RL_Active_Tracking-master\\data\\train_data", help="data_path")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--save_interval", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--z_dim", type=int, default=16, help="z embedding dimension")
@@ -357,8 +357,8 @@ def get_config():
     parser.add_argument("--use_mlp_velocity", action='store_true', default=True, help="use MLP to encode continuous velocity")
     parser.add_argument("--cvae_mode", type=str, default='cat_all', choices=['full_encoding', 'cat_all', 'avgpool_fusion'])
     # L = L_recon + β*L_KL + λ*(L_speed + L_ang)
-    parser.add_argument("--beta", type=float, default=0.1, help="kl divergence weight")
-    parser.add_argument("--lambda_speed", type=float, default=0.05, help="weak supervision")
+    parser.add_argument("--beta", type=float, default=0.0, help="kl divergence weight")
+    parser.add_argument("--lambda_speed", type=float, default=0.001, help="weak supervision")
     parser.add_argument("--predict_state_difference", action='store_true', default=False)
     parser.add_argument("--output_variance", type=str, default='output', choices=['zero', 'parameter', 'output', 'output_raw', 'reference'])
     parser.add_argument("--logvar_min", type=float, default=-15.0, help="Minimum log variance (was -20, too small!)")
@@ -380,9 +380,17 @@ def main():
     np.random.seed(config.seed)
     random.seed(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and config.use_gpu else "cpu")
+    print(f"\n️  Device: {device}")
     
-    wandb.init(project="cvae-training", name=config.run_name, config=vars(config))
+    print(f"\n Initializing WandB...")
+    try:
+        wandb.init(project="cvae-training", name=config.run_name, config=vars(config))
+        print(f"✅ WandB initialized")
+    except Exception as e:
+        print(f"⚠️  WandB initialization failed: {e}")
+        print(f"   Continuing without WandB logging...")
     
+    print(f"\n Loading feature extractor...")
     feature_extractor = None
     if config.frozen_cnn_lstm_path and config.use_cnn_features:
         output_type = "cnn" if config.use_cnn_features else "lstm"
@@ -422,16 +430,28 @@ def main():
         logvar_max=config.logvar_max,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    print(f"\n Creating DataLoader (batch_size={config.batch_size}, num_workers=0, pin_memory=False)...")
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=0, pin_memory=False, drop_last=True)
+    print(f"✅ DataLoader created. Total batches per epoch: {len(train_loader)}")
+    
     model.train()
     global_step = 0
     
+    print(f"\n Starting training for {config.n_epochs} epochs...")
     for epoch in range(config.n_epochs):
         epoch_start_time = time.time()
         epoch_losses = defaultdict(float)
         n_batches = 0
+        
+        print(f"\n Epoch {epoch+1}/{config.n_epochs}")
         for batch_idx, batch_data in enumerate(train_loader):
+            if batch_idx == 0:
+                print(f"   Processing first batch...")
+            
             obs, action, reward, next_obs, tracker_id, target_id, linear_v_id, angular_v_id, linear_v_max, angular_v_max = batch_data
+            
+            if batch_idx == 0:
+                print(f"   Moving data to GPU...")
             
             obs = obs.to(device)
             action = action.to(device)
@@ -444,6 +464,9 @@ def main():
             linear_v_max = linear_v_max.to(device)
             angular_v_max = angular_v_max.to(device)
             
+            if batch_idx == 0:
+                print(f"   Computing loss...")
+            
             kl_loss, obs_loss, rew_loss, unscaled_obs, unscaled_rew, ref_obs, ref_rew, \
                 speed_loss, linear_loss, angular_loss, total_loss = \
                 get_cvae_loss(model, obs, action, reward, next_obs, 
@@ -451,10 +474,16 @@ def main():
                             linear_v_max, angular_v_max, 
                             beta=config.beta, lambda_speed=getattr(config, 'lambda_speed', 0.1))
             
+            if batch_idx == 0:
+                print(f"   Backward pass...")
+            
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
 
+            if batch_idx == 0:
+                print(f"   First batch completed!")
+            
             # kl_loss, obs_loss etc. are already scalars from loss_dict
             # total_loss is a tensor, need .item()
             epoch_losses["kl"] += kl_loss
@@ -466,6 +495,10 @@ def main():
             epoch_losses["total"] += total_loss.item()
             n_batches += 1
             global_step += 1
+            
+            # Progress every 50 batches
+            if (batch_idx + 1) % 50 == 0:
+                print(f"   Batch {batch_idx+1}/{len(train_loader)} - loss: {total_loss.item():.4f}")
         epoch_time = time.time() - epoch_start_time
         avg_losses = {k: v/n_batches for k, v in epoch_losses.items()}
         print(f"epoch {epoch+1}/{config.n_epochs}, kl_loss: {avg_losses['kl']:.6f}, obs_loss: {avg_losses['obs']:.6f}, rew_loss: {avg_losses['rew']:.6f}, speed_loss: {avg_losses['speed']:.6f} (linear: {avg_losses['linear']:.6f}, angular: {avg_losses['angular']:.6f}), total_loss: {avg_losses['total']:.6f}, time: {epoch_time:.2f}s")
