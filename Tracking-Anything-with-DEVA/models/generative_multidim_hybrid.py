@@ -169,6 +169,10 @@ class CVAE_4D_Hybrid(nn.Module):
                  logvar_max: float = 2.0):
         super(CVAE_4D_Hybrid, self).__init__()
         
+        # ✅ 添加BatchNorm层归一化CNN特征 - 解决loss过高问题
+        self.obs_bn = nn.BatchNorm1d(state_size)
+        self.next_obs_bn = nn.BatchNorm1d(state_size)
+        
         self.mode = mode
         self.z_dim = z_dim
         self.state_size = state_size
@@ -292,33 +296,37 @@ class CVAE_4D_Hybrid(nn.Module):
         return linear_loss, angular_loss
     
     def compute_total_loss(self, obs, action, reward, next_obs, tracker_id, target_id, linear_v_max, angular_v_max, beta=0.1, lambda_speed=0.1):
-        # L = L_recon + β * L_KL + λ * (L_speed + L_ang)
-        mean, logvar, z_sample = self.forward_encoder(
-            obs, action, reward, next_obs,
-            tracker_id, target_id,
-            linear_v_max=linear_v_max,
-            angular_v_max=angular_v_max
-        )
         
-        recon_loss_s, recon_loss_r, *_ = self.decoder.losses(obs, action, reward, next_obs, z_sample)
+        mean, logvar, z_sample = self.forward_encoder(obs, action, reward, next_obs,
+            tracker_id, target_id, linear_v_max=linear_v_max, angular_v_max=angular_v_max)
+        
+        recon_loss_s, recon_loss_r, *_ = tuple(self.decoder.losses(obs, action, reward, next_obs, z_sample))
         recon_loss = recon_loss_s + recon_loss_r
-        
-        kl_loss = self.compute_kl_divergence(mean, logvar).mean()        
+        kl_loss = self.compute_kl_divergence(mean, logvar).mean()
+        # weak supervision
         linear_loss, angular_loss = self.compute_speed_distance_loss(mean, linear_v_max, angular_v_max)
         speed_loss = linear_loss + angular_loss
+        # L = L_recon + β * L_KL + λ * (L_speed + L_ang)
+        total_loss = recon_loss + beta * kl_loss + lambda_speed * speed_loss
         
-        total_loss = recon_loss + beta * kl_loss + lambda_speed * speed_loss        
         loss_dict = {
             'recon_loss': recon_loss.item() if isinstance(recon_loss, torch.Tensor) else recon_loss,
+            'obs_loss': recon_loss_s.item() if isinstance(recon_loss_s, torch.Tensor) else recon_loss_s,  
+            'rew_loss': recon_loss_r.item() if isinstance(recon_loss_r, torch.Tensor) else recon_loss_r, 
             'kl_loss': kl_loss.item(),
             'speed_loss': speed_loss.item(),
             'linear_loss': linear_loss.item(),
             'angular_loss': angular_loss.item(),
             'total_loss': total_loss.item()
-        }        
+        }
+        
         return total_loss, loss_dict
     
     def forward_encoder(self, obs, action, reward, next_obs, tracker_id, target_id, linear_v_id=None, angular_v_id=None, linear_v_max=None, angular_v_max=None):
+        # ✅ 归一化CNN特征
+        obs = self.obs_bn(obs)
+        next_obs = self.next_obs_bn(next_obs)
+        
         if isinstance(tracker_id, torch.Tensor):
             batch_size = tracker_id.shape[0]
             device = tracker_id.device
@@ -329,7 +337,7 @@ class CVAE_4D_Hybrid(nn.Module):
             tracker_id = torch.tensor([tracker_id], device=device)
             target_id = torch.tensor([target_id], device=device)
         
-        # ============= Mode 1: Full Encoding (192 tasks，使用离散ID) =============
+        # ============= Mode 1: Full Encoding =============
         if self.mode == 'full_encoding':            
             if not isinstance(linear_v_id, torch.Tensor):
                 linear_v_id = torch.tensor([linear_v_id], device=device)
@@ -345,7 +353,7 @@ class CVAE_4D_Hybrid(nn.Module):
             z = reparameterize(mean, logvar)
             return mean, logvar, z
         
-        # ============= Mode 2: Cat All (分层logvar + MLP无归一化编码) =============
+        # ============= Mode 2: Cat All =============
         elif self.mode == 'cat_all':
             if not isinstance(linear_v_max, torch.Tensor):
                 linear_v_max = torch.tensor([linear_v_max], device=device, dtype=torch.float)
@@ -383,7 +391,7 @@ class CVAE_4D_Hybrid(nn.Module):
             z = reparameterize(mean, logvar)
             return mean, logvar, z
         
-        # ============= Mode 3: Avgpool Fusion (MLP无归一化编码) =============
+        # ============= Mode 3: Avgpool Fusion =============
         elif self.mode == 'avgpool_fusion':
             if not isinstance(linear_v_max, torch.Tensor):
                 linear_v_max = torch.tensor([linear_v_max], device=device, dtype=torch.float)
