@@ -28,7 +28,7 @@ export CUDA_HOME=/path/to/cuda/
 
 cd Grounded-Segment-Anything
 python -m pip install -e segment_anything
-python -m pip install -e GroundingDINO
+python -m pip install -e GroundingDINO  ## you can choose --no-build-isolation
 pip install --upgrade diffusers[torch]
 ```
 **Install DEVA:**  
