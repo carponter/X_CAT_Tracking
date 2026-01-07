@@ -263,19 +263,15 @@ class AllDataDataset(Dataset):
                 start_idx = i * batch_size
                 end_idx = min((i + 1) * batch_size, len(self.states))
 
-                # Process states
                 states_batch = torch.from_numpy(self.states[start_idx:end_idx]).to(self.feature_extractor.device)
                 with torch.no_grad():
                     features_batch = self.feature_extractor.extract_cnn_features(states_batch).cpu().numpy()
                 self.state_features.append(features_batch)
-                
-                # Process next_states
                 next_states_batch = torch.from_numpy(self.next_states[start_idx:end_idx]).to(self.feature_extractor.device)
                 with torch.no_grad():
                     next_features_batch = self.feature_extractor.extract_cnn_features(next_states_batch).cpu().numpy()
                 self.next_state_features.append(next_features_batch)
                 
-                # Progress reporting
                 if (i + 1) % 100 == 0 or (i + 1) == num_batches:
                     progress = (i + 1) / num_batches * 100
                     print(f"   Progress: {i+1}/{num_batches} ({progress:.1f}%) - Processed {end_idx}/{len(self.states)} samples")
@@ -317,7 +313,6 @@ class AllDataDataset(Dataset):
                 torch.tensor(self.angular_v_maxs_arr[idx], dtype=torch.float)
             )
 
-
 def get_cvae_loss(model, obs, action, reward, next_obs, 
                   tracker_id, target_id, linear_v_id, angular_v_id,
                   linear_v_max, angular_v_max, beta=0.1, lambda_speed=0.1):
@@ -344,7 +339,7 @@ def get_cvae_loss(model, obs, action, reward, next_obs,
 def get_config():
     parser = argparse.ArgumentParser(description='CVAE Training')
     parser.add_argument("--run_name", type=str, default="CVAE-mutidim-cnn-", help="run_name")
-    parser.add_argument("--data_path", type=str, default="C:\\Offline_RL_Active_Tracking-master\\Offline_RL_Active_Tracking-master\\data\\train_data", help="data_path")
+    parser.add_argument("--data_path", type=str, default="/root/autodl-tmp/data", help="data_path")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--save_interval", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=128)
@@ -366,7 +361,7 @@ def get_config():
     parser.add_argument("--merge_reward_next_state", action='store_true', default=False)
     parser.add_argument("--use_gpu", action="store_true", default=True)
     parser.add_argument("--input_type", type=str, default='deva')
-    parser.add_argument("--frozen_cnn_lstm_path", type=str, default="C:\\Offline_RL_Active_Tracking-master\\Offline_RL_Active_Tracking-master\\trained_models\\CQL-SAC-base-CQL-SAC1000.pth", help="pretrained weights path")
+    parser.add_argument("--frozen_cnn_lstm_path", type=str, default="/root/autodl-tmp/zip/CQL-SAC-base-CQL-SAC1000.pth", help="pretrained weights path")
     parser.add_argument("--use_cnn_features", action="store_true", default=True)
     parser.add_argument("--use_lstm_features", action="store_true", default=False)
     args = parser.parse_args()
@@ -467,6 +462,14 @@ def main():
             if batch_idx == 0:
                 print(f"   Computing loss...")
             
+            # # DEBUG: Check for NaN/Inf in inputs for first few batches
+            # if batch_idx < 3:
+            #     print(f"\n   [DEBUG Batch {batch_idx}]")
+            #     print(f"   obs: range=[{obs.min():.4f}, {obs.max():.4f}], has_nan={torch.isnan(obs).any()}, has_inf={torch.isinf(obs).any()}")
+            #     print(f"   action: range=[{action.min():.4f}, {action.max():.4f}]")
+            #     print(f"   linear_v_max: range=[{linear_v_max.min():.1f}, {linear_v_max.max():.1f}]")
+            #     print(f"   angular_v_max: range=[{angular_v_max.min():.1f}, {angular_v_max.max():.1f}]")
+            
             kl_loss, obs_loss, rew_loss, unscaled_obs, unscaled_rew, ref_obs, ref_rew, \
                 speed_loss, linear_loss, angular_loss, total_loss = \
                 get_cvae_loss(model, obs, action, reward, next_obs, 
@@ -474,8 +477,13 @@ def main():
                             linear_v_max, angular_v_max, 
                             beta=config.beta, lambda_speed=getattr(config, 'lambda_speed', 0.1))
             
-            if batch_idx == 0:
-                print(f"   Backward pass...")
+            # # DEBUG: Check losses for first few batches
+            # if batch_idx < 3:
+            #     print(f"   total_loss: {total_loss.item():.6f}, kl: {kl_loss:.6f}, obs: {obs_loss:.6f}, rew: {rew_loss:.6f}")
+            #     print(f"   has_nan={torch.isnan(total_loss).any()}, has_inf={torch.isinf(total_loss).any()}")
+            
+            # if batch_idx == 0:
+            #     print(f"   Backward pass...")
             
             optimizer.zero_grad()
             total_loss.backward()
