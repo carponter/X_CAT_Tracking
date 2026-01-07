@@ -169,10 +169,6 @@ class CVAE_4D_Hybrid(nn.Module):
                  logvar_max: float = 2.0):
         super(CVAE_4D_Hybrid, self).__init__()
         
-        # ✅ 添加BatchNorm层归一化CNN特征 - 解决loss过高问题
-        self.obs_bn = nn.BatchNorm1d(state_size)
-        self.next_obs_bn = nn.BatchNorm1d(state_size)
-        
         self.mode = mode
         self.z_dim = z_dim
         self.state_size = state_size
@@ -300,9 +296,33 @@ class CVAE_4D_Hybrid(nn.Module):
         mean, logvar, z_sample = self.forward_encoder(obs, action, reward, next_obs,
             tracker_id, target_id, linear_v_max=linear_v_max, angular_v_max=angular_v_max)
         
+        # Check for NaN/Inf after encoding
+        if torch.isnan(mean).any() or torch.isinf(mean).any():
+            print(f"⚠️  WARNING: NaN/Inf detected in mean after encoding!")
+            print(f"   mean range: [{mean.min():.4f}, {mean.max():.4f}]")
+        if torch.isnan(logvar).any() or torch.isinf(logvar).any():
+            print(f"⚠️  WARNING: NaN/Inf detected in logvar after encoding!")
+            print(f"   logvar range: [{logvar.min():.4f}, {logvar.max():.4f}]")
+        if torch.isnan(z_sample).any() or torch.isinf(z_sample).any():
+            print(f"⚠️  WARNING: NaN/Inf detected in z_sample after reparameterization!")
+            print(f"   z_sample range: [{z_sample.min():.4f}, {z_sample.max():.4f}]")
+        
         recon_loss_s, recon_loss_r, *_ = tuple(self.decoder.losses(obs, action, reward, next_obs, z_sample))
+        
+        # Check reconstruction losses
+        if recon_loss_s is not None and (torch.isnan(recon_loss_s).any() or torch.isinf(recon_loss_s).any()):
+            print(f"⚠️  WARNING: NaN/Inf detected in recon_loss_s!")
+        if recon_loss_r is not None and (torch.isnan(recon_loss_r).any() or torch.isinf(recon_loss_r).any()):
+            print(f"⚠️  WARNING: NaN/Inf detected in recon_loss_r!")
+        
         recon_loss = recon_loss_s + recon_loss_r
         kl_loss = self.compute_kl_divergence(mean, logvar).mean()
+        
+        # Check KL loss
+        if torch.isnan(kl_loss).any() or torch.isinf(kl_loss).any():
+            print(f"⚠️  WARNING: NaN/Inf detected in kl_loss!")
+            print(f"   kl_loss: {kl_loss.item()}")
+        
         # weak supervision
         linear_loss, angular_loss = self.compute_speed_distance_loss(mean, linear_v_max, angular_v_max)
         speed_loss = linear_loss + angular_loss
@@ -323,9 +343,6 @@ class CVAE_4D_Hybrid(nn.Module):
         return total_loss, loss_dict
     
     def forward_encoder(self, obs, action, reward, next_obs, tracker_id, target_id, linear_v_id=None, angular_v_id=None, linear_v_max=None, angular_v_max=None):
-        # ✅ 归一化CNN特征
-        obs = self.obs_bn(obs)
-        next_obs = self.next_obs_bn(next_obs)
         
         if isinstance(tracker_id, torch.Tensor):
             batch_size = tracker_id.shape[0]
@@ -350,6 +367,8 @@ class CVAE_4D_Hybrid(nn.Module):
                 z_full = z_full.expand(batch_size, -1)
             
             mean, logvar = torch.split(z_full, self.z_dim, dim=-1)
+            # CRITICAL FIX: Clamp logvar to prevent overflow
+            logvar = torch.clamp(logvar, self.decoder.logvar_min, self.decoder.logvar_max)
             z = reparameterize(mean, logvar)
             return mean, logvar, z
         
@@ -360,24 +379,30 @@ class CVAE_4D_Hybrid(nn.Module):
             if not isinstance(angular_v_max, torch.Tensor):
                 angular_v_max = torch.tensor([angular_v_max], device=device, dtype=torch.float)
             
-            if linear_v_max.dim() == 0:
-                linear_v_max = linear_v_max.unsqueeze(0).unsqueeze(0)
-            elif linear_v_max.dim() == 1:
-                linear_v_max = linear_v_max.unsqueeze(-1)           
-            if angular_v_max.dim() == 0:
-                angular_v_max = angular_v_max.unsqueeze(0).unsqueeze(0)
-            elif angular_v_max.dim() == 1:
-                angular_v_max = angular_v_max.unsqueeze(-1)
+            # Normalize velocity inputs to [0, 1] range to prevent large outputs
+            # This is CRITICAL for numerical stability
+            linear_v_normalized = (linear_v_max - 100.0) / 300.0  # [100, 400] -> [0, 1]
+            angular_v_normalized = (angular_v_max - 15.0) / 75.0  # [15, 90] -> [0, 1]
+            
+            if linear_v_normalized.dim() == 0:
+                linear_v_normalized = linear_v_normalized.unsqueeze(0).unsqueeze(0)
+            elif linear_v_normalized.dim() == 1:
+                linear_v_normalized = linear_v_normalized.unsqueeze(-1)           
+            if angular_v_normalized.dim() == 0:
+                angular_v_normalized = angular_v_normalized.unsqueeze(0).unsqueeze(0)
+            elif angular_v_normalized.dim() == 1:
+                angular_v_normalized = angular_v_normalized.unsqueeze(-1)
             
             tracker_m = self.tracker_mean[tracker_id]      # [batch, component_dim]
             tracker_lv = self.tracker_logvar[tracker_id]
             target_m = self.target_mean[target_id]
             target_lv = self.target_logvar[target_id]
             
-            linear_v_m = self.linear_v_mean_encoder(linear_v_max)        # [batch, component_dim]
-            linear_v_lv = self.linear_v_logvar_encoder(linear_v_max)
-            angular_v_m = self.angular_v_mean_encoder(angular_v_max)
-            angular_v_lv = self.angular_v_logvar_encoder(angular_v_max)
+            # Use normalized velocities
+            linear_v_m = self.linear_v_mean_encoder(linear_v_normalized)        # [batch, component_dim]
+            linear_v_lv = self.linear_v_logvar_encoder(linear_v_normalized)
+            angular_v_m = self.angular_v_mean_encoder(angular_v_normalized)
+            angular_v_lv = self.angular_v_logvar_encoder(angular_v_normalized)
             
             if tracker_m.dim() == 1:
                 tracker_m = tracker_m.unsqueeze(0)
@@ -388,6 +413,8 @@ class CVAE_4D_Hybrid(nn.Module):
             
             mean = torch.cat([tracker_m, target_m, linear_v_m, angular_v_m], dim=-1)
             logvar = torch.cat([tracker_lv, target_lv, linear_v_lv, angular_v_lv], dim=-1)
+            # CRITICAL FIX: Clamp logvar to prevent exp() overflow
+            logvar = torch.clamp(logvar, self.decoder.logvar_min, self.decoder.logvar_max)
             z = reparameterize(mean, logvar)
             return mean, logvar, z
         
@@ -396,39 +423,62 @@ class CVAE_4D_Hybrid(nn.Module):
             if not isinstance(linear_v_max, torch.Tensor):
                 linear_v_max = torch.tensor([linear_v_max], device=device, dtype=torch.float)
             if not isinstance(angular_v_max, torch.Tensor):
-                angular_v_max = torch.tensor([angular_v_max], device=device, dtype=torch.float)            
-            # 确保维度正确 [batch, 1]
-            if linear_v_max.dim() == 0:
-                linear_v_max = linear_v_max.unsqueeze(0).unsqueeze(0)
-            elif linear_v_max.dim() == 1:
-                linear_v_max = linear_v_max.unsqueeze(-1)            
-            if angular_v_max.dim() == 0:
-                angular_v_max = angular_v_max.unsqueeze(0).unsqueeze(0)
-            elif angular_v_max.dim() == 1:
-                angular_v_max = angular_v_max.unsqueeze(-1)
+                angular_v_max = torch.tensor([angular_v_max], device=device, dtype=torch.float)
             
-            linear_v_m = self.linear_v_mean_encoder(linear_v_max)        # [batch, quarter_dim]
-            linear_v_lv = self.linear_v_logvar_encoder(linear_v_max)            
-            angular_v_m = self.angular_v_mean_encoder(angular_v_max)
-            angular_v_lv = self.angular_v_logvar_encoder(angular_v_max)
+            # Normalize velocity inputs to [0, 1] range for numerical stability
+            linear_v_normalized = (linear_v_max - 100.0) / 300.0  # [100, 400] -> [0, 1]
+            angular_v_normalized = (angular_v_max - 15.0) / 75.0  # [15, 90] -> [0, 1]
+
+            if linear_v_normalized.dim() == 0:
+                linear_v_normalized = linear_v_normalized.unsqueeze(0).unsqueeze(0)
+            elif linear_v_normalized.dim() == 1:
+                linear_v_normalized = linear_v_normalized.unsqueeze(-1)            
+            if angular_v_normalized.dim() == 0:
+                angular_v_normalized = angular_v_normalized.unsqueeze(0).unsqueeze(0)
+            elif angular_v_normalized.dim() == 1:
+                angular_v_normalized = angular_v_normalized.unsqueeze(-1)
+            
+            # Use normalized velocities
+            linear_v_m = self.linear_v_mean_encoder(linear_v_normalized)        # [batch, quarter_dim]
+            linear_v_lv = self.linear_v_logvar_encoder(linear_v_normalized)            
+            angular_v_m = self.angular_v_mean_encoder(angular_v_normalized)
+            angular_v_lv = self.angular_v_logvar_encoder(angular_v_normalized)
             action_space_m = torch.cat([linear_v_m, angular_v_m], dim=-1)  # [batch, half_dim]
             action_space_lv = torch.cat([linear_v_lv, angular_v_lv], dim=-1)
+            
             tracker_m = self.tracker_mean[tracker_id]          # [batch, half_dim]
             tracker_lv = self.tracker_logvar[tracker_id]
             if tracker_m.dim() == 1:
                 tracker_m = tracker_m.unsqueeze(0)
                 tracker_lv = tracker_lv.unsqueeze(0)
-            # ???? why /2.0 and /4.0 ?
+            
+            # CRITICAL FIX: Use log-space addition for numerical stability
+            # Instead of: log((exp(lv1) + exp(lv2)) / 4)
+            # Use: log_sum_exp([lv1, lv2]) - log(4)
+            # This prevents overflow when logvars are large
             tracker_policy_m = (action_space_m + tracker_m) / 2.0
-            tracker_policy_lv = torch.log((action_space_lv.exp() + tracker_lv.exp()) / 4.0)
+            
+            # Clamp logvars before any operations to prevent overflow
+            action_space_lv = torch.clamp(action_space_lv, self.decoder.logvar_min, self.decoder.logvar_max)
+            tracker_lv = torch.clamp(tracker_lv, self.decoder.logvar_min, self.decoder.logvar_max)
+            
+            # Use log-sum-exp trick for numerical stability
+            stacked_lv = torch.stack([action_space_lv, tracker_lv], dim=0)  # [2, batch, half_dim]
+            max_lv = torch.max(stacked_lv, dim=0)[0]  # [batch, half_dim]
+            tracker_policy_lv = max_lv + torch.log(
+                torch.exp(action_space_lv - max_lv) + torch.exp(tracker_lv - max_lv)
+            ) - torch.log(torch.tensor(4.0, device=device))
             
             target_m = self.target_mean[target_id]             # [batch, half_dim]
             target_lv = self.target_logvar[target_id]
             if target_m.dim() == 1:
                 target_m = target_m.unsqueeze(0)
                 target_lv = target_lv.unsqueeze(0)
+            
             mean = torch.cat([tracker_policy_m, target_m], dim=-1)
             logvar = torch.cat([tracker_policy_lv, target_lv], dim=-1)
+            # CRITICAL FIX: Final clamp to ensure bounds
+            logvar = torch.clamp(logvar, self.decoder.logvar_min, self.decoder.logvar_max)
             z = reparameterize(mean, logvar)
             return mean, logvar, z
     
