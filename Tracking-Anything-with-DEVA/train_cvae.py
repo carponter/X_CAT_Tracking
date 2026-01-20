@@ -339,7 +339,7 @@ def get_cvae_loss(model, obs, action, reward, next_obs,
 def get_config():
     parser = argparse.ArgumentParser(description='CVAE Training')
     parser.add_argument("--run_name", type=str, default="CVAE-mutidim-cnn-", help="run_name")
-    parser.add_argument("--data_path", type=str, default="/root/autodl-tmp/data", help="data_path")
+    parser.add_argument("--data_path", type=str, default="C:\\Offline_RL_Active_Tracking-master\\Offline_RL_Active_Tracking-master\\data\\train_data", help="data_path")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--save_interval", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=128)
@@ -352,17 +352,18 @@ def get_config():
     parser.add_argument("--use_mlp_velocity", action='store_true', default=True, help="use MLP to encode continuous velocity")
     parser.add_argument("--cvae_mode", type=str, default='cat_all', choices=['full_encoding', 'cat_all', 'avgpool_fusion'])
     # L = L_recon + β*L_KL + λ*(L_speed + L_ang)
-    parser.add_argument("--beta", type=float, default=0.0, help="kl divergence weight")
-    parser.add_argument("--lambda_speed", type=float, default=0.001, help="weak supervision")
+    parser.add_argument("--beta", type=float, default=0.1, help="kl divergence weight")
+    parser.add_argument("--lambda_speed", type=float, default=0.0, help="weak supervision")
     parser.add_argument("--predict_state_difference", action='store_true', default=False)
     parser.add_argument("--output_variance", type=str, default='output', choices=['zero', 'parameter', 'output', 'output_raw', 'reference'])
     parser.add_argument("--logvar_min", type=float, default=-15.0, help="Minimum log variance (was -20, too small!)")
     parser.add_argument("--logvar_max", type=float, default=2.0)
     parser.add_argument("--merge_reward_next_state", action='store_true', default=False)
     parser.add_argument("--use_gpu", action="store_true", default=True)
+    parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="gradient clipping max norm")
     parser.add_argument("--input_type", type=str, default='deva')
-    parser.add_argument("--frozen_cnn_lstm_path", type=str, default="/root/autodl-tmp/zip/CQL-SAC-base-CQL-SAC1000.pth", help="pretrained weights path")
-    parser.add_argument("--use_cnn_features", action="store_true", default=True)
+    parser.add_argument("--frozen_cnn_lstm_path", type=str, default="C:\\Offline_RL_Active_Tracking-master\\Offline_RL_Active_Tracking-master\\trained_models\\CQL-SAC-base-CQL-SAC1000.pth", help="pretrained weights path")
+    parser.add_argument("--use_cnn_features", action="store_true", default=False)
     parser.add_argument("--use_lstm_features", action="store_true", default=False)
     args = parser.parse_args()
     return args
@@ -459,6 +460,11 @@ def main():
             linear_v_max = linear_v_max.to(device)
             angular_v_max = angular_v_max.to(device)
             
+            # Flatten obs and next_obs if using raw images (not frozen features)
+            if feature_extractor is None:
+                obs = obs.view(obs.size(0), -1)  # [batch, 3, 64, 64] -> [batch, 12288]
+                next_obs = next_obs.view(next_obs.size(0), -1)
+            
             if batch_idx == 0:
                 print(f"   Computing loss...")
             
@@ -487,6 +493,10 @@ def main():
             
             optimizer.zero_grad()
             total_loss.backward()
+            
+            # 梯度裁剪，避免异常值带偏
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.grad_clip_norm)
+            
             optimizer.step()
 
             if batch_idx == 0:
